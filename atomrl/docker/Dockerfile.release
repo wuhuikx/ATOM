@@ -1,0 +1,115 @@
+# AtomRL release image — everything the DAPO colocated examples need, so that a
+# fresh container only has to pull code (or bind-mount it) and run.
+#
+# What is baked in:
+#   - the current ATOM checkout with in-tree AtomRL/Lumen
+#   - pinned official AITER and MORI checkouts
+#   - the flydsl and ROCm Triton the official AITER checkout pins
+#   - megatron-core / Apex / TransformerEngine, for example 7
+#   - the vLLM AITER RMSNorm patch, which otherwise has to be re-applied by hand
+#     every time the container is recreated
+#
+# What is NOT baked in:
+#   - model weights and datasets (bind-mount $DATA_ROOT)
+#   - aiter's JIT kernels. Those need a GPU to compile, which `docker build` does
+#     not have; release/precompile_kernels.sh does it in a running container and
+#     commits the result. Skipping that step costs ~20 min on the first FP8 run.
+#
+# Build:  bash atomrl/release/build_image.sh
+# Run:    see release/README.md
+
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.23.0
+FROM ${BASE_IMAGE}
+
+ARG PYTORCH_ROCM_ARCH=gfx950
+ARG AITER_REPO=https://github.com/ROCm/aiter.git
+ARG AITER_SHA=2037a7711885f26acd5683fcde0200a5588e595f
+ARG MORI_REPO=https://github.com/ROCm/mori.git
+ARG MORI_SHA=9c42e3240b33359331b2cf2141b28886055da583
+ARG FLYDSL_VERSION=0.5.0
+ARG MEGATRON_CORE_VERSION=0.18.2
+ARG WITH_MEGATRON=1
+
+ENV RL_ROOT=/opt/atomrl \
+    LUMEN_DIR=/opt/atomrl/ATOM/atomrl/lumen \
+    AITER_DIR=/opt/atomrl/aiter \
+    MORI_DIR=/opt/atomrl/mori \
+    ATOM_DIR=/opt/atomrl/ATOM \
+    PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
+    DEBIAN_FRONTEND=noninteractive \
+    GPU_ARCHS=${PYTORCH_ROCM_ARCH}
+
+SHELL ["/bin/bash", "-lc"]
+
+# ---------------------------------------------------------------- sources ----
+RUN mkdir -p "$RL_ROOT" && git config --global --add safe.directory '*'
+
+RUN git clone "${AITER_REPO}" "$AITER_DIR" \
+ && cd "$AITER_DIR" \
+ && git checkout --detach "${AITER_SHA}" \
+ && git submodule update --init --recursive
+
+# ATOM uses the SPDX license string form, supported by setuptools 77+.
+RUN pip install --no-cache-dir "setuptools>=77" setuptools-scm \
+ && git clone "${MORI_REPO}" "$MORI_DIR" \
+ && cd "$MORI_DIR" \
+ && git fetch origin "${MORI_SHA}" && git checkout --detach FETCH_HEAD \
+ && git submodule update --init --recursive \
+ && PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH}" python setup.py build_ext --inplace
+# The context excludes .git (Dockerfile.dockerignore), so the commit is passed in.
+ARG ATOM_COMMIT=unknown
+ENV ATOM_COMMIT=${ATOM_COMMIT}
+COPY . /opt/atomrl/ATOM
+
+# ----------------------------------------------------------- python deps ----
+# flydsl first and on its own line: the base image's amd-aiter wheel pins
+# flydsl<0.1.5 while the aiter source tree pins 0.5.0. They are mutually
+# exclusive by design; PYTHONPATH decides which aiter wins at runtime, and the
+# resulting pip "dependency conflict" warning about amd-aiter is expected.
+RUN pip install --no-cache-dir "flydsl==${FLYDSL_VERSION}"
+
+RUN pip install --no-cache-dir \
+      "ray[default]>=2.9" "accelerate>=0.28" datasets \
+      "math_verify[antlr4_13_2]" "omegaconf>=2.3,<2.4" safetensors wandb \
+      psutil ninja pybind11 einops pandas
+
+# Editable installs so a bind-mounted checkout over any of these paths keeps
+# working without reinstalling. aiter's setup.py replaces the base image's
+# Triton 3.6.0 with the ROCm Triton it pins (3.8.0); ATOM main needs it --
+# with 3.6.0 its packed H2D kernel dies in the launcher ("function takes
+# exactly 14 arguments (13 given)") while capturing CUDA graphs.
+RUN cd "$AITER_DIR" && python3 setup.py develop \
+ && LUMEN_BUILD_EXTENSIONS=1 pip install --no-cache-dir --no-build-isolation -e "$ATOM_DIR" --no-deps
+
+# ------------------------------------------------- megatron / apex / TE ------
+# Only needed by example 7. Set --build-arg WITH_MEGATRON=0 to skip (saves
+# ~40 min of build time and ~20 GB).
+RUN if [ "${WITH_MEGATRON}" = "1" ]; then \
+      pip install --no-cache-dir --no-deps "megatron-core==${MEGATRON_CORE_VERSION}"; \
+    fi
+
+COPY atomrl/release/build_apex_te.sh /tmp/build_apex_te.sh
+RUN if [ "${WITH_MEGATRON}" = "1" ]; then bash /tmp/build_apex_te.sh; fi
+
+# ------------------------------------------------- vLLM RMSNorm patch --------
+# Examples 2/3/4 run the rollout with VLLM_ROCM_USE_AITER=1, and the plain AITER
+# RMSNorm path has to pass use_model_sensitive_rmsnorm=1 to match Lumen's
+# training-side norm. Patching the wheel here means it survives `docker rm`.
+COPY atomrl/release/patch_vllm_aiter_rmsnorm.py /opt/atomrl/patch_vllm_aiter_rmsnorm.py
+RUN python3 /opt/atomrl/patch_vllm_aiter_rmsnorm.py
+
+COPY atomrl/release/entrypoint.sh /opt/atomrl/entrypoint.sh
+RUN chmod +x /opt/atomrl/entrypoint.sh
+
+# Also set these as image ENV, not just in the entrypoint: `docker exec` does not
+# run the entrypoint, so without this an interactive `docker exec ... python3 -c
+# "import aiter"` resolves to the base image's amd-aiter wheel and dies with
+# "cannot import name 'fly_values' from flydsl.compiler.protocol" — the wheel
+# pins flydsl<0.1.5 while we ship 0.5.0. The examples' own launcher sets its own
+# PYTHONPATH, so only ad-hoc commands are affected, which makes it easy to miss.
+ENV PYTHONPATH=/opt/atomrl/ATOM/atomrl:/opt/atomrl/aiter:/opt/atomrl/mori/python \
+    AITER_JIT_DIR=/opt/atomrl/aiter-jit
+
+WORKDIR /opt/atomrl/ATOM/atomrl
+ENTRYPOINT ["/opt/atomrl/entrypoint.sh"]
+CMD ["sleep", "infinity"]
