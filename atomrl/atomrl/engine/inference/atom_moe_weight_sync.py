@@ -15,6 +15,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
 # The trainer's fused expert leaf -> the ATOM FusedMoE parameter it belongs in.
 # Both are (experts, out, in) with matching dims, and w13's first half along the
 # intermediate dim is the gate projection, the second half the up projection --

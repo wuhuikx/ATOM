@@ -84,6 +84,7 @@ _REUSE_QUANT_BUFFER = os.environ.get("LUMEN_REUSE_QUANT_BUFFER", "0") == "1"
 _CAST_AMAX_AVAILABLE: bool | None = None
 AITER_STATIC_QUANT = True
 
+
 def _probe_cast_transpose() -> bool:
     """Return True if Triton fused cast+transpose can run on this machine (cached)."""
     global _CAST_TRANSPOSE_AVAILABLE

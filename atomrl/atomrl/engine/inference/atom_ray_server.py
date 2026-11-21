@@ -526,9 +526,7 @@ class ATOMRayServer:
         if failed:
             raise RuntimeError(
                 f"ATOM {method} failed on {len(failed)}/{len(replies)} ranks: "
-                + "; ".join(
-                    f"tp{reply.tp_rank}: {reply.error}" for reply in failed[:8]
-                )
+                + "; ".join(f"tp{reply.tp_rank}: {reply.error}" for reply in failed[:8])
             )
         return [reply.value for reply in replies]
 

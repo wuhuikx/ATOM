@@ -29,9 +29,7 @@ def main():
         "--output_dir",
         type=str,
         default=str(
-            Path(os.environ.get("DATA_ROOT", "/data"))
-            / "models"
-            / "Qwen3-30B-A3B"
+            Path(os.environ.get("DATA_ROOT", "/data")) / "models" / "Qwen3-30B-A3B"
         ),
         help="Directory to save the downloaded model",
     )

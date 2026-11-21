@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
+
 def ray_head_ip() -> str:
     head_ip = os.environ.get("RAY_HEAD_IP")
     if not head_ip:
