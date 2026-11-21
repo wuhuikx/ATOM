@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+from contextlib import contextmanager
 
 from atom.model_engine.capabilities import EngineCapabilities, WorkerCapabilities
 from atom.model_engine.collective_rpc import RpcResult
@@ -99,6 +100,12 @@ class AsyncLLMEngine(LLMEngine):
             )
         workers = [WorkerCapabilities.from_payload(r.value) for r in replies]
         return EngineCapabilities.from_workers(config=self.config, workers=workers)
+
+    @contextmanager
+    def weight_sync_session(self):
+        """Serialize a bucketed weight update with the engine's scheduler."""
+        with self.core_mgr.weight_sync_session():
+            yield
 
     def sleep(self, level: int = 1):
         """Release GPU resources.

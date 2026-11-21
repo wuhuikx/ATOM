@@ -2391,6 +2391,10 @@ class Config:
     enable_rl: bool = False
     # The version of the loaded weights; a committed update may name another.
     weight_version: str = "default"
+    # Disable AITER's custom IPC all-reduce path during distributed setup.
+    # This is a public runner option so callers do not need to patch AITER
+    # internals when a platform cannot provide HIP IPC handles.
+    disable_custom_all_reduce: bool = False
     # The runners take weight syncs and say which they cannot
     # (`get_worker_capabilities`), as RLHFModelRunner does: EngineCore asks
     # them once, at startup. Set by AsyncLLMEngine, and by --enable-rl when it
