@@ -23,7 +23,7 @@ the A/B baseline.
 |---|---|
 | client | AtomRL's ATOMesh rollout client (`engine/inference/atomesh_rollout.py`, #5 and #6), in the trainer process |
 | trainer | AtomRL's actor workers; rank 0 hosts the RCCL rendezvous and broadcasts (`send_weights_rdma`) |
-| ATOMesh | launched with `--enable-rl --rl-api-key <key> --policy prefix_hash`, D12's long-rollout profile, and `--rl-control-timeout-secs` set to `weight_sync.timeout_s` |
+| ATOMesh | launched with `--backend atom --enable-rl --rl-api-key <key> --policy prefix_hash` (`--backend` defaults to `sglang`, which would label every worker `engine=sglang` and leave `selector=engine=atom` matching none), D12's long-rollout profile, and `--rl-control-timeout-secs` set to `weight_sync.timeout_s` |
 | worker | an ATOM `api_server` with `--enable-rl --weight-version 0`, TP1 |
 
 ## Scenarios
@@ -167,6 +167,17 @@ client committed v=6
       0 < 6 -> rejected: WeightVersionMismatch, the step fails
 ```
 
+### S5. Old prefixes after a sync
+
+```text
+before the sync to 7:  /generate P (prompt of group g)  -> fills the prefix cache on worker w
+sync to 7:             receive_weights_rdma is a weight update on w:
+                       KV pool zeroed, prefix index forgotten (A5's path)
+after the sync:        /generate P again (a later sample, or a resubmission)
+                       -> meta_info.cached_tokens == 0, weight_version "7"
+a later sample of P after that request  -> cached_tokens > 0 again, on v7's KV
+```
+
 ## Decisions
 
 ### C1. `/generate` is SGLang's, logprobs included
@@ -222,8 +233,8 @@ when logprobs are on; #4 fills it). The parity reference for #4's test is
 - Basis: code: `atom/model_engine/token_logprobs.py: TokenLogprob`;
   `scheduler.py: Scheduler.postprocess` (`seq.logprobs` takes field 0);
   `api_server.py: generate_async` (text empty under logprobs);
-  `protocol.py: BetaCompletionRequest` ("Completions return no token
-  probabilities yet").
+  `protocol.py: CompletionRequest` (the `/v1/completions` body) has no
+  `logprobs` field and ignores extra keys.
 - Rejected: compare against `/v1/completions`, as #4's brief says. It
   returns none, so that test cannot be written.
 
@@ -244,16 +255,29 @@ version of a fresh run.
   start_step`, then `step + 1`).
 - Rejected: report an integer. D8 and SGLang both type it a string.
 
+This supersedes two decisions of the control-plane design on this line.
+M1 gave `main`'s `receive_weights_rdma` no route, since no client sent that
+stream; M9 rejected deriving `weight_version` from the stream version for
+the same reason. #718 now assigns the `/receive_weights_rdma` route on
+`main`'s stream format to the engine side, with AtomRL's trainer as the
+stream's client, so the route exists (C11) and a committed stream names the
+version. M1's other half stands: SMG's trainer keeps SGLang's routes and
+per-tensor broadcasts, unchanged.
+
 ### C5. A group is `num_generations` requests
 
 Each sample of a prompt is its own `/generate` with the same body, sent
 concurrently; the rows come back in send order. The brief and #718 (M1,
 `prefix_hash`) fix this. ATOMesh hashes the first 256 `input_ids`, so a
-group lands on one worker unless that worker's load passes 1.25 times the
-mean, when later samples walk the ring to the next.
+group lands on the worker the hash ring picks. When that worker's load is
+past 1.25 times the mean, a sample goes instead to the least-loaded worker
+within that bound (or stays on the ring's worker if none is), so a group can
+split across workers.
 
 - Basis: code: `src/policies/prefix_hash.rs: PrefixHashConfig`
-  (`prefix_token_count` 256, `load_factor` 1.25);
+  (`prefix_token_count` 256, `load_factor` 1.25),
+  `PrefixHashPolicy.find_worker_with_load_balance` (overloaded ring worker:
+  least-loaded worker under the threshold, not a ring walk);
   `src/routers/prepare/inference.rs` routes a single `input_ids` array by
   tokens; `api_server.py: _GenerateRequest` has no `n`.
 - Rejected: one request with `sampling_params.n`. ATOM's `/generate` has no
@@ -361,6 +385,9 @@ node). A worker that cannot join refuses in its join vote, so its
 - Rejected: engine routes for preflight and capabilities. Surface no M1
   item needs.
 
+The route itself is new on this line: control-plane M1 left
+`receive_weights_rdma` unrouted, which #718 overrides (C4).
+
 ### C12. Timeouts, auth and failed requests
 
 - The group's broadcast timeout is the engine's default 600 s:
@@ -382,6 +409,22 @@ node). A worker that cannot join refuses in its join vote, so its
 - Rejected: a `timeout_s` field on `init_weights_update_group`. SGLang's
   body has none, and the value already matches. Rejected: retry a failed
   `/generate` once. It hides a failure the acceptance counts.
+
+### C13. No old prefix is hit after a sync
+
+A committed stream drops every cached prefix, so the first request on a
+pre-sync prefix after a sync reports `meta_info.cached_tokens == 0`. The
+client records `cached_tokens` and `weight_version` per sample; a
+pre-sync prompt's first post-sync sample with `cached_tokens > 0` is the
+violation #718's version item counts.
+
+- Basis: code: `engine_utility.py: WEIGHT_UPDATE_UTILITY_CMDS` holds
+  `receive_weights_rdma`, so its `kv_change` is `"weights"`: the pool is
+  zeroed and the prefix index forgotten before FINISH (D6, control-plane
+  A5); `api_server.py: _rl_generate` reports `cached_tokens` from the
+  request output's `num_cached_tokens`.
+- Rejected: a separate probe route for the prefix index. `cached_tokens`
+  already shows a hit on the wire, as A5 reads it.
 
 ## Simpler alternative
 
@@ -419,7 +462,7 @@ from a failed sync, streaming `/generate`, `n` above 1 in one request.
 |---|---|---|---|
 | `atom/entrypoints/openai/api_server.py` | `/receive_weights_rdma` in `_RL_ROUTES`; version set to `str(version)` on commit | #3 | C4, C11 |
 | `atom/entrypoints/openai/api_server.py` | `return_logprob` on `/generate`: `output_token_logprobs`, `text` decoded | #4 | C1, C3 |
-| `atomrl/atomrl/engine/inference/atomesh_rollout.py` | `generate_batch` / group: C2 mapping, C5 fan-out, C6 check, C7 raise, C12 failures | #5 | C1-C7, C12 |
+| `atomrl/atomrl/engine/inference/atomesh_rollout.py` | `generate_batch` / group: C2 mapping, C5 fan-out, C6 check, C7 raise, C12 failures, C13 `cached_tokens` per sample | #5 | C1-C7, C12, C13 |
 | `atomrl/atomrl/engine/inference/atomesh_rollout.py` | setup join, `sync_weights(version)`, `paused()` | #6 | C8-C11 |
 | AtomRL config, trainer, launcher | `--weight-version 0`, `--rl-api-key`, `--rl-control-timeout-secs`; refuse FP8 sync and `require_rdma` under `atomesh`; backend `pause()` / `resume()` send nothing | #7 | C4, C9, C11, C12 |
 
@@ -429,6 +472,6 @@ from a failed sync, streaming `/generate`, `n` above 1 in one request.
 | #718 item | Rests on |
 |---|---|
 | Accuracy: `reward/accuracy`, `k3_kl` match direct | C2, C3, C5 |
-| Version: every worker reports the new version after each sync | C4, C9, C10 |
+| Version: every worker reports the new version after each sync; old-prefix hits are 0 | C4, C9, C10; C13 (`meta_info.cached_tokens` of a pre-sync prompt's first post-sync sample) |
 | Stability: 0 failed requests, 0 workers dropped | C7, C10, C12 |
 | Performance record: sync time, trainer wait, `prefix_hash` hits | C8, C9; `meta_info.cached_tokens` per sample |
