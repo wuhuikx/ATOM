@@ -1466,6 +1466,17 @@ class RLTrainer:
             total_s,
         )
 
+    def _atomesh_rollout_metrics(self) -> dict[str, float]:
+        """Under ``transport: atomesh``, the prefix-cache and weight-version
+        statistics of the samples generated since the last call (validation
+        samples included), as ``rollout/atomesh_*``; ``{}`` otherwise."""
+        client = getattr(self, "_atomesh_client", None)
+        if client is None:
+            return {}
+        return {
+            f"rollout/atomesh_{k}": v for k, v in client.drain_sample_meta().items()
+        }
+
     def _sync_weights_safetensors(self, mgr) -> None:
         """Weight sync for TP>1 ATOM: export HF weights to /dev/shm, ATOM reloads."""
         t0 = time.time()
@@ -5468,6 +5479,7 @@ class RLTrainer:
             metrics["timing/train_s"] = train_time
             if gen_tokens > 0 and gen_time > 0:
                 metrics["throughput/gen_tok_per_s"] = gen_tokens / gen_time
+            metrics.update(self._atomesh_rollout_metrics())
             metrics["reward/mean"] = float(rewards.mean().item())
             metrics["reward/accuracy"] = float(
                 sum(1 for r in rewards if r > 0) / max(1, len(rewards))
