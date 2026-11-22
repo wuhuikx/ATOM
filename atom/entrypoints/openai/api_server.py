@@ -3809,6 +3809,7 @@ class _GenerateRequest(BaseModel):
         default_factory=_GenerateSamplingParams
     )
     stream: bool = False
+    return_logprob: bool = False
 
 
 async def _rl_generate(request: _GenerateRequest, raw_request: Request):
@@ -3830,6 +3831,10 @@ async def _rl_generate(request: _GenerateRequest, raw_request: Request):
             ignore_eos=params.ignore_eos,
             top_k=params.top_k,
             top_p=params.top_p,
+            logprobs=request.return_logprob,
+        )
+        sampling_params.validate_logprob_options(
+            _get_engine_config(), synthetic=synthetic_token_text is not None
         )
         output = await _run_nonstream_with_disconnect(
             generate_async(
@@ -3844,22 +3849,36 @@ async def _rl_generate(request: _GenerateRequest, raw_request: Request):
         raise HTTPException(status_code=400, detail=str(e)) from e
     if output is None:
         raise RuntimeError("No output generated")
+    text = output["text"]
+    meta_info = {
+        "id": request_id,
+        "finish_reason": _sglang_finish_reason(
+            output["finish_reason"], output["num_tokens_output"]
+        ),
+        "prompt_tokens": output["num_tokens_input"],
+        "completion_tokens": output["num_tokens_output"],
+        "cached_tokens": output["num_cached_tokens"],
+        "weight_version": output["weight_version"],
+    }
+    if request.return_logprob:
+        # generate_async leaves the text to chat's logprob collector.
+        text = delivered_text(output["token_ids"])
+        meta_info["output_token_logprobs"] = _sglang_token_logprobs(
+            output["token_ids"], output["logprobs"]
+        )
     return JSONResponse(
-        {
-            "text": output["text"],
-            "output_ids": list(output["token_ids"]),
-            "meta_info": {
-                "id": request_id,
-                "finish_reason": _sglang_finish_reason(
-                    output["finish_reason"], output["num_tokens_output"]
-                ),
-                "prompt_tokens": output["num_tokens_input"],
-                "completion_tokens": output["num_tokens_output"],
-                "cached_tokens": output["num_cached_tokens"],
-                "weight_version": output["weight_version"],
-            },
-        }
+        {"text": text, "output_ids": list(output["token_ids"]), "meta_info": meta_info}
     )
+
+
+def _sglang_token_logprobs(token_ids, records) -> list[list]:
+    """SGLang's ``[logprob, token_id, null]`` per output token: the sampled
+    token's logprob, field 0 of the engine's record."""
+    if len(records) != len(token_ids):
+        raise RuntimeError(
+            f"{len(records)} logprobs for {len(token_ids)} output tokens"
+        )
+    return [[float(rec[0]), int(tok), None] for rec, tok in zip(records, token_ids)]
 
 
 def _sglang_finish_reason(reason: str | None, completion_tokens: int) -> dict | None:
