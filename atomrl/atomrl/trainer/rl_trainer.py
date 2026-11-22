@@ -1175,7 +1175,7 @@ class RLTrainer:
         """
         import ray
 
-        if self._atomesh_client is not None:
+        if getattr(self, "_atomesh_client", None) is not None:
             self._sync_weights_atomesh()
             return
         mgr = self._ray_rollout_mgr
