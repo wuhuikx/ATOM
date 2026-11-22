@@ -194,4 +194,5 @@ Key entry points:
 | DeepSeek-V4.1-Flash | `recipes/DeepSeek-V4.1-Flash.md` |
 | Qwen3.8-Flash-Next mono decode | `recipes/Qwen3.8-Flash-Next-Mono-Program.md` |
 | ATOMesh RL control plane (pause / refit / resume) | `docs/atomesh_rl_control_plane.md` |
+| AtomRL rollout through ATOMesh (wire contract) | `docs/atomesh_rl_atomrl_contract.md` |
 | Design principles (RL line) | `docs/agent_team_principles.md` |
