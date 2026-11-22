@@ -291,7 +291,16 @@ class AtomConfig:
     # Ray-controller online rollout path. The common rollout knobs (sampling,
     # sequence limits, IPC bucket size, sleep) are still read from vllm_cfg so the
     # DAPO vLLM/ATOM configs stay comparable.
+    #   "fifo"     -> in-process AtomEngine
+    #   "ray_http" -> ATOM replicas inside Ray actors, driven over Ray RPC
+    #   "atomesh"  -> ATOM workers started outside Ray (--enable-rl) behind an
+    #                 ATOMesh router at base_url; rollout through its /generate,
+    #                 weight sync over RCCL through its /v1/rl routes
     transport: str = "fifo"
+    # atomesh only: the router's URL and its --rl-api-key, the bearer of every
+    # /v1/rl call.
+    base_url: str = ""
+    api_key: str = ""
     data_parallel_size: int = 1
     expert_parallel_size: int = 1
     enable_prefix_caching: bool = False
@@ -1065,6 +1074,7 @@ class AtomRLConfig:
     val_batch_size: int = 16
 
     def __post_init__(self) -> None:
+        self._check_atomesh_rollout()
         # Fail-close unsupported R3 combinations at construction. Reuses the
         # single source of truth in ``r3_scope`` (imported directly, not via
         # ``atomrl.moe``, to avoid cycling through ``R3Manager``). Runs on
@@ -1077,6 +1087,54 @@ class AtomRLConfig:
             replay_mode=self.moe.r3.replay_mode,
             generation_backend=self.policy.generation_backend,
         )
+
+    def _check_atomesh_rollout(self) -> None:
+        """Refuse what ``transport: atomesh`` cannot serve.
+
+        Its ATOM workers run outside Ray on GPUs of their own and take weights
+        only as a BF16 RCCL stream from the trainer's rank 0, so nothing that
+        shares the trainer's GPUs with the rollout applies: no CUDA IPC or
+        shared-folder sync, no sleep between rollout and training, no Ray
+        rollout pool. The stream has no RDMA preflight route, so RDMA cannot be
+        required, and the rollout cannot overlap training.
+        """
+        atom = self.policy.generation.atom_cfg
+        if atom.transport != "atomesh":
+            return
+        ray_cfg = self.controller.ray
+        sync = self.weight_sync
+        refused = {
+            "policy.generation_backend must be 'atom'": (
+                self.policy.generation_backend != GenerationBackend.ATOM.value
+            ),
+            "policy.generation.atom_cfg.base_url must name the ATOMesh router": (
+                not atom.base_url
+            ),
+            "controller.ray.enabled must be true": not ray_cfg.enabled,
+            "controller.ray.rollout.num_workers must be 0: the ATOM workers are "
+            "ATOMesh's, not Ray's": ray_cfg.rollout.num_workers > 0,
+            "weight_sync.backend must be 'rdma' (RCCL); 'auto' and "
+            "'shared_folder' serve a rollout colocated with the trainer": (
+                sync.backend != "rdma"
+            ),
+            "weight_sync.rdma.require_rdma must be false: the workers have no "
+            "RDMA preflight route": sync.rdma.require_rdma,
+            "weight_sync must not quantize to FP8: the workers receive BF16 "
+            "only": (sync.fp8_quantize or sync.fp8_quantization_location is not None),
+            "policy.generation.vllm_cfg.enable_sleep_mode must be false: the "
+            "rollout does not share the trainer's GPUs": (
+                self.policy.generation.vllm_cfg.enable_sleep_mode
+            ),
+            "controller.ray.one_step_off_policy and "
+            "controller.ray.fully_async.enabled must be false": (
+                ray_cfg.one_step_off_policy or ray_cfg.fully_async.enabled
+            ),
+        }
+        problems = [why for why, bad in refused.items() if bad]
+        if problems:
+            raise ValueError(
+                "policy.generation.atom_cfg.transport='atomesh': " + "; ".join(problems)
+            )
 
     @classmethod
     def from_yaml(

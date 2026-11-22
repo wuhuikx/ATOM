@@ -10,6 +10,7 @@ Supports three modes:
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import json
 import logging
@@ -218,6 +219,58 @@ class _RayRolloutGroups:
         self._mgr.resume_all()
 
 
+def _rdma_sender_metrics(
+    sender: dict[str, Any], version: int, total_s: float
+) -> dict[str, float]:
+    """A weight sync's metrics from the trainer's RCCL sender statistics."""
+    metrics = {
+        "timing/weight_sync_rdma_s": total_s,
+        "weight_sync/bytes": float(sender.get("bytes", 0.0)),
+        "weight_sync/gbps": float(sender.get("gbps", 0.0)),
+        "weight_sync/buckets": float(sender.get("buckets", 0.0)),
+        "weight_sync/version": float(version),
+    }
+    for key in ("gather_s", "pack_s", "bcast_s", "final_sync_s"):
+        metrics[f"timing/weight_sync_rdma_sender_{key}"] = float(
+            sender.get(key, 0.0) or 0.0
+        )
+    return metrics
+
+
+class _AtomMeshEngine:
+    """The rollout engine under ``atom_cfg.transport: atomesh``.
+
+    Generation goes through ``AtomMeshRolloutClient`` to ATOM workers behind
+    ATOMesh. They run outside Ray on GPUs of their own, so there is nothing to
+    sleep or wake between rollout and training; weights reach them only through
+    ``RLTrainer._sync_weights_atomesh``. Shutdown leaves the weight group.
+    """
+
+    enable_sleep = False
+    _sleeping = False
+
+    def __init__(self, client: Any) -> None:
+        self.client = client
+
+    def generate_tokens(
+        self,
+        prompt_token_ids_list: list[list[int]],
+        sampling_params: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        return asyncio.run(
+            self.client.generate_batch(prompt_token_ids_list, sampling_params)
+        )
+
+    def sleep(self, level: int | None = None) -> None:
+        pass
+
+    def wake(self, tags: list[str] | None = None) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        asyncio.run(self.client.leave_weight_group())
+
+
 class RLTrainer:
     """Coordinates rollout, reference, reward, and actor for RL training.
 
@@ -287,6 +340,8 @@ class RLTrainer:
         self._ray_use_atom: bool = False
         self._ray_vllm_engine: Any = None
         self._ray_rollout_mgr: Any = None
+        # atom_cfg.transport: atomesh; the AtomMeshRolloutClient, set in setup.
+        self._atomesh_client: Any = None
         self._last_weight_sync_metrics: dict[str, float] = {}
         self._is_distributed: bool = torch.distributed.is_initialized()
         self._rank: int = torch.distributed.get_rank() if self._is_distributed else 0
@@ -840,6 +895,38 @@ class RLTrainer:
             weight_backend,
         )
 
+    def _setup_atomesh_rollout(self, vcfg: Any, atom_cfg: Any) -> None:
+        """Generate and sync weights through ATOMesh, whose ATOM workers run
+        outside Ray; join their RCCL weight group with the actors' rank 0."""
+        from atomrl.engine.inference.atomesh_rollout import AtomMeshRolloutClient
+
+        sync = self.config.weight_sync
+        max_model_len = getattr(atom_cfg, "max_model_len", None) or getattr(
+            vcfg, "max_model_len", None
+        )
+        client = AtomMeshRolloutClient(
+            str(atom_cfg.base_url),
+            max_model_len=int(max_model_len or 0),
+            api_key=str(atom_cfg.api_key) or None,
+            control_timeout_s=float(sync.timeout_s),
+        )
+        group = asyncio.run(
+            client.join_weight_group(
+                self._actor_wg,
+                interface=str(sync.rdma.interface),
+                timeout_s=int(sync.timeout_s),
+                group_name=f"atomesh-rl-weights-{os.getpid()}",
+            )
+        )
+        self._atomesh_client = client
+        self._ray_vllm_engine = _AtomMeshEngine(client)
+        logger.info(
+            "ATOMesh rollout ready at %s: %d workers in weight group (world %d).",
+            client.base_url,
+            len(client.worker_ids),
+            group["world_size"],
+        )
+
     @property
     def _r3_rollout_replay(self) -> bool:
         """Whether to carry rollout expert selections into the training forward."""
@@ -1088,6 +1175,9 @@ class RLTrainer:
         """
         import ray
 
+        if self._atomesh_client is not None:
+            self._sync_weights_atomesh()
+            return
         mgr = self._ray_rollout_mgr
         if mgr is None or self._actor_wg is None:
             return
@@ -1309,19 +1399,13 @@ class RLTrainer:
             for row in (result if isinstance(result, list) else [result])
             if isinstance(row, dict)
         ]
-        self._last_weight_sync_metrics = {
-            "timing/weight_sync_rdma_s": total_s,
-            "weight_sync/bytes": float(sender.get("bytes", 0.0)),
-            "weight_sync/gbps": float(sender.get("gbps", 0.0)),
-            "weight_sync/buckets": float(sender.get("buckets", 0.0)),
-            "weight_sync/version": float(version),
-            "weight_sync/backend_rdma": 1.0,
-            "weight_sync/fp8_trainer_quantized": float(fp8_sync),
-        }
-        for key in ("gather_s", "pack_s", "bcast_s", "final_sync_s"):
-            self._last_weight_sync_metrics[f"timing/weight_sync_rdma_sender_{key}"] = (
-                float(sender.get(key, 0.0) or 0.0)
-            )
+        self._last_weight_sync_metrics = _rdma_sender_metrics(sender, version, total_s)
+        self._last_weight_sync_metrics.update(
+            {
+                "weight_sync/backend_rdma": 1.0,
+                "weight_sync/fp8_trainer_quantized": float(fp8_sync),
+            }
+        )
         for key in (
             "wait_s",
             "recv_s",
@@ -1358,6 +1442,29 @@ class RLTrainer:
         )
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])
+
+    def _sync_weights_atomesh(self) -> None:
+        """Stream the actors' BF16 weights to the ATOMesh workers as version
+        ``global_step + 1``; the client pauses, confirms, commits and resumes."""
+        version = int(self.global_step) + 1
+        started = time.perf_counter()
+        sender = asyncio.run(
+            self._atomesh_client.sync_weights(
+                version, bucket_size_mb=int(self.config.weight_sync.bucket_size_mb)
+            )
+        )
+        total_s = time.perf_counter() - started
+        self._last_weight_sync_metrics = _rdma_sender_metrics(sender, version, total_s)
+        self._last_weight_sync_metrics["weight_sync/backend_atomesh"] = 1.0
+        logger.info(
+            "ATOMesh weight sync committed: version=%d buckets=%d bytes=%.1fGB "
+            "broadcast=%.2fs total=%.2fs",
+            version,
+            int(sender.get("buckets", 0)),
+            float(sender.get("bytes", 0)) / 1e9,
+            float(sender.get("seconds", 0)),
+            total_s,
+        )
 
     def _sync_weights_safetensors(self, mgr) -> None:
         """Weight sync for TP>1 ATOM: export HF weights to /dev/shm, ATOM reloads."""
@@ -1650,14 +1757,18 @@ class RLTrainer:
         self._ray_use_vllm = (
             self._use_vllm and str(getattr(vcfg, "transport", "fifo")) == "ray_http"
         )
-        self._ray_use_atom = (
-            self._gen_backend == "atom"
-            and str(getattr(atom_cfg, "transport", "fifo")) == "ray_http"
+        atom_transport = str(getattr(atom_cfg, "transport", "fifo"))
+        self._ray_use_atom = self._gen_backend == "atom" and atom_transport in (
+            "ray_http",
+            "atomesh",
         )
         self._ray_rollout_mgr = None
         self._ray_vllm_engine = None
         if self._ray_use_vllm:
             self._setup_ray_vllm_rollout(model_name, vcfg)
+            self._atom_engine = None
+        elif self._ray_use_atom and atom_transport == "atomesh":
+            self._setup_atomesh_rollout(vcfg, atom_cfg)
             self._atom_engine = None
         elif self._ray_use_atom:
             self._release_actor_cached_memory()
