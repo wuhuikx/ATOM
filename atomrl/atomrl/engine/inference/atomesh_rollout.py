@@ -84,9 +84,9 @@ class AtomMeshRolloutClient:
     whatever each weight sync commits.
 
     ``sample_meta`` collects, per accepted sample and in completion order,
-    the worker's request id, ``weight_version`` and ``cached_tokens``: the
-    record that shows whether a prompt sent again after a weight sync hit a
-    prefix cached under the old weights.
+    its prompt's token ids, the worker's request id, ``weight_version`` and
+    ``cached_tokens``: the record that shows whether a prompt sent again
+    after a weight sync hit a prefix cached under the old weights.
 
     ``api_key`` is ATOMesh's ``--rl-api-key``, presented on every ``/v1/rl``
     call; ``control_timeout_s`` is ATOMesh's ``--rl-control-timeout-secs``.
@@ -220,6 +220,7 @@ class AtomMeshRolloutClient:
 
         self.sample_meta.append(
             {
+                "prompt_token_ids": body["input_ids"],
                 "request_id": request_id,
                 "weight_version": int(version),
                 "cached_tokens": int(meta.get("cached_tokens") or 0),

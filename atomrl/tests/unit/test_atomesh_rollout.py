@@ -195,13 +195,16 @@ def test_a_version_newer_than_committed_is_rejected():
         _generate(stub, [[77]], {"max_tokens": 8}, committed_version=6)
 
 
-def test_a_sample_that_crossed_a_commit_is_accepted():
+# A: sent at 6, finished on 7 after the commit. B: finished on 6 just
+# before the sync, its answer read after the commit to 7.
+@pytest.mark.parametrize("answered", ["7", "6"])
+def test_a_sample_that_crossed_a_commit_is_accepted(answered):
     clients: list[AtomMeshRolloutClient] = []
 
     def commit_then_answer(body):
         # The sync to 7 commits while the request is in flight.
         clients[0].committed_version = 7
-        return 200, _generate_body(body, weight_version="7")
+        return 200, _generate_body(body, weight_version=answered)
 
     stub = Stub(commit_then_answer)
 
@@ -212,8 +215,26 @@ def test_a_sample_that_crossed_a_commit_is_accepted():
     rows = asyncio.run(stub.run(use))
     assert rows[0]["token_ids"] == OUTPUTS[77]["token_ids"]
     assert clients[0].sample_meta == [
-        {"request_id": "generate-3", "weight_version": 7, "cached_tokens": 3}
+        {
+            "prompt_token_ids": [77],
+            "request_id": "generate-3",
+            "weight_version": int(answered),
+            "cached_tokens": 3,
+        }
     ]
+
+
+def test_sample_meta_names_each_sample_prompt():
+    # The stub's request id is generate-<output length>, distinct per prompt.
+    prompts = [[151644, 872, 198, 785], [9906, 11], [77]]
+    client, _ = _generate(Stub(), prompts, {"max_tokens": 8})
+
+    by_id = {m["request_id"]: m["prompt_token_ids"] for m in client.sample_meta}
+    assert by_id == {
+        "generate-4": [151644, 872, 198, 785],
+        "generate-1": [9906, 11],
+        "generate-3": [77],
+    }
 
 
 @pytest.mark.parametrize(
