@@ -434,7 +434,12 @@ class EngineUtilityHandler:
                         self._weight_sync_in_progress = False
                         self._weight_sync_failure = None
                         self._awaiting_finish = None
-                        if self._awaiting_weight_version is not None:
+                        # A handler built without a scheduler serves no
+                        # version to set.
+                        if (
+                            self._awaiting_weight_version is not None
+                            and self.scheduler is not None
+                        ):
                             self.scheduler.weight_version = (
                                 self._awaiting_weight_version
                             )
