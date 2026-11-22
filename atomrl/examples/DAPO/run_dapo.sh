@@ -205,7 +205,9 @@ esac
 
 # 清理旧进程
 [ "${RAY_ROLE:-}" = driver ] || ray stop --force >/dev/null 2>&1 || true
-python3 - <<'PY'
+# KEEP_PROCS=1 skips the sweep below: run_atomesh.sh's ATOM workers run outside
+# Ray, and their engine processes match its patterns.
+[ "${KEEP_PROCS:-0}" = 1 ] || python3 - <<'PY'
 import os
 import signal
 import subprocess
