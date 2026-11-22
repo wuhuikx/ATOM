@@ -50,6 +50,8 @@ GENERATE_TIMEOUT_S = 14400.0
 # so a worker that times out comes back as ATOMesh's failed call, not as a
 # client timeout that names no worker.
 _CONTROL_SLACK_S = 30.0
+# The engine label of the workers the weight group and its fan-outs cover.
+_ENGINE = "atom"
 
 
 class AtomMeshRolloutError(RuntimeError):
@@ -90,7 +92,8 @@ class AtomMeshRolloutClient:
 
     ``api_key`` is ATOMesh's ``--rl-api-key``, presented on every ``/v1/rl``
     call; ``control_timeout_s`` is ATOMesh's ``--rl-control-timeout-secs``.
-    ``selector`` picks the workers the control fan-outs reach.
+    The control fan-outs reach every ATOM worker (``selector=engine=atom``),
+    the same workers ``join_weight_group`` picks from ``/v1/rl/workers``.
     """
 
     def __init__(
@@ -101,7 +104,6 @@ class AtomMeshRolloutClient:
         timeout_s: float = GENERATE_TIMEOUT_S,
         api_key: str | None = None,
         control_timeout_s: float = 600.0,
-        selector: str = "engine=atom",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.max_model_len = int(max_model_len)
@@ -110,7 +112,6 @@ class AtomMeshRolloutClient:
         self.sample_meta: list[dict[str, Any]] = []
         self.api_key = api_key
         self.control_timeout_s = float(control_timeout_s)
-        self.selector = selector
         # Set by join_weight_group: the trainer's worker group, the group's
         # name and the ids of the workers that joined it.
         self.trainer = None
@@ -257,10 +258,9 @@ class AtomMeshRolloutClient:
             status, listing = await self._control(session, "GET", "/v1/rl/workers")
             if status != 200:
                 raise WeightSyncError(f"/v1/rl/workers answered {status}: {listing}")
-            engine = self.selector.partition("=")[2]
-            workers = [w for w in listing["workers"] if w["engine"] == engine]
+            workers = [w for w in listing["workers"] if w["engine"] == _ENGINE]
             if not workers:
-                raise WeightSyncError(f"ATOMesh lists no {engine} worker")
+                raise WeightSyncError(f"ATOMesh lists no {_ENGINE} worker")
             offsets, rank = [], 1
             for w in workers:
                 # A DP worker's engines would each need their own ranks, and
@@ -334,8 +334,9 @@ class AtomMeshRolloutClient:
             raise WeightSyncError("join_weight_group() has not run")
         version = int(version)
         async with self.paused() as session:
-            # Arm the receivers before the sender starts and await both
-            # together: the broadcast needs every rank inside it at once.
+            # Start the receivers and the sender together and await them
+            # together: the broadcast needs every rank inside it at once, and
+            # whichever end arrives first waits there for the others.
             receive = asyncio.ensure_future(
                 self._fanout(
                     session,
@@ -447,7 +448,7 @@ class AtomMeshRolloutClient:
             method,
             f"/v1/rl/engine/{engine_path}",
             body,
-            params={"selector": self.selector},
+            params={"selector": f"engine={_ENGINE}"},
         )
         if status not in (200, 207) or not isinstance(out, dict):
             raise WeightSyncError(f"{engine_path} fan-out answered {status}: {out}")
