@@ -11,12 +11,14 @@ Supports three modes:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import gc
 import json
 import logging
 import math
 import os
 import shutil
+import threading
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -135,11 +137,12 @@ def _format_chat_prompt(tokenizer: Any, messages: list[dict[str, Any]]) -> str:
     )
 
 
-class _RayRolloutGroups:
-    """Prompt groups on the Ray vLLM replicas, the backend of ``StreamingRollout``.
+class _RolloutGroups:
+    """Prompt groups, the backend of ``StreamingRollout``: what every rollout
+    pool shares, scoring a finished group and dynamic sampling.
 
-    All methods run on the rollout thread. A group's completions all go to one
-    replica, the one with the fewest groups in flight.
+    All methods run on the rollout thread. A subclass starts a group, waits
+    for it and hands back its rows and ground truth (``_collect``).
     """
 
     def __init__(
@@ -148,10 +151,53 @@ class _RayRolloutGroups:
         self._trainer = trainer
         self._num_generations = num_generations
         self._use_filter = use_filter
-        self._mgr = trainer._ray_rollout_mgr
-        self._servers = self._mgr.servers
         want_lp = bool(trainer.config.policy.generation.vllm_cfg.calculate_log_probs)
         self._sampling_params = trainer._ray_sampling_params(want_lp)
+
+    def _collect(self, handle: Any) -> tuple[list[dict[str, Any]], str]:
+        raise NotImplementedError
+
+    def finish(self, handle: Any) -> tuple | None:
+        from atomrl.algorithms.dapo_sampling import filter_groups_keep_mask
+
+        rows, gt = self._collect(handle)
+        sequences, seq_mask, prompt_lengths, rollout_lp, ragged = (
+            self._trainer._assemble_ray_rollout(rows)
+        )
+        gts = [gt] * self._num_generations
+        rewards, responses, accs = self._trainer._compute_rewards_full(
+            sequences,
+            seq_mask,
+            prompt_lengths,
+            gts,
+            verbose=False,
+        )
+        if self._use_filter:
+            _, kept = filter_groups_keep_mask(accs, [0] * self._num_generations)
+            if not kept:
+                return None
+        return (
+            sequences,
+            seq_mask,
+            prompt_lengths,
+            rewards,
+            responses,
+            gts,
+            rollout_lp,
+            ragged,
+        )
+
+
+class _RayRolloutGroups(_RolloutGroups):
+    """Prompt groups on the Ray vLLM or ATOM replicas. A group's completions
+    all go to one replica, the one with the fewest groups in flight."""
+
+    def __init__(
+        self, trainer: RLTrainer, num_generations: int, use_filter: bool
+    ) -> None:
+        super().__init__(trainer, num_generations, use_filter)
+        self._mgr = trainer._ray_rollout_mgr
+        self._servers = self._mgr.servers
         self._load = [0] * len(self._servers)
         self._groups: dict[Any, tuple[int, str]] = {}
 
@@ -179,38 +225,12 @@ class _RayRolloutGroups:
         )
         return ready
 
-    def finish(self, handle: Any) -> tuple | None:
+    def _collect(self, handle: Any) -> tuple[list[dict[str, Any]], str]:
         import ray
-
-        from atomrl.algorithms.dapo_sampling import filter_groups_keep_mask
 
         replica, gt = self._groups.pop(handle)
         self._load[replica] -= 1
-        sequences, seq_mask, prompt_lengths, rollout_lp, ragged = (
-            self._trainer._assemble_ray_rollout(ray.get(handle))
-        )
-        gts = [gt] * self._num_generations
-        rewards, responses, accs = self._trainer._compute_rewards_full(
-            sequences,
-            seq_mask,
-            prompt_lengths,
-            gts,
-            verbose=False,
-        )
-        if self._use_filter:
-            _, kept = filter_groups_keep_mask(accs, [0] * self._num_generations)
-            if not kept:
-                return None
-        return (
-            sequences,
-            seq_mask,
-            prompt_lengths,
-            rewards,
-            responses,
-            gts,
-            rollout_lp,
-            ragged,
-        )
+        return ray.get(handle), gt
 
     def pause(self) -> None:
         self._mgr.pause_all(mode="keep", clear_cache=True)
@@ -244,6 +264,10 @@ class _AtomMeshEngine:
     ATOMesh. They run outside Ray on GPUs of their own, so there is nothing to
     sleep or wake between rollout and training; weights reach them only through
     ``RLTrainer._sync_weights_atomesh``. Shutdown leaves the weight group.
+
+    The fully async rollout starts prompt groups with ``submit_group``, which
+    runs them on an event loop of the engine's own thread, so they stay in
+    flight while the trainer's thread syncs weights.
     """
 
     enable_sleep = False
@@ -251,6 +275,24 @@ class _AtomMeshEngine:
 
     def __init__(self, client: Any) -> None:
         self.client = client
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop_thread: threading.Thread | None = None
+
+    def submit_group(
+        self, prompt_ids: list[int], num_generations: int, sampling: dict[str, Any]
+    ) -> concurrent.futures.Future:
+        """Start ``num_generations`` samples of one prompt; their rows arrive
+        on the returned future."""
+        if self._loop is None:
+            self._loop = asyncio.new_event_loop()
+            self._loop_thread = threading.Thread(
+                target=self._loop.run_forever, name="atomesh-rollout", daemon=True
+            )
+            self._loop_thread.start()
+        return asyncio.run_coroutine_threadsafe(
+            self.client.generate_group(prompt_ids, num_generations, sampling),
+            self._loop,
+        )
 
     def generate_tokens(
         self,
@@ -268,7 +310,63 @@ class _AtomMeshEngine:
         pass
 
     def shutdown(self) -> None:
+        if self._loop is not None:
+            asyncio.run_coroutine_threadsafe(_cancel_other_tasks(), self._loop).result()
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._loop_thread.join()
+            self._loop.close()
+            self._loop = None
         asyncio.run(self.client.leave_weight_group())
+
+
+async def _cancel_other_tasks() -> None:
+    """Cancel every other task of the running loop and wait for them, so
+    their HTTP sessions close before the loop stops."""
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+class _AtomMeshRolloutGroups(_RolloutGroups):
+    """Prompt groups through ATOMesh, whose ``prefix_hash`` policy places each
+    sample. A group that fails, or whose samples carry a weight version the
+    client never committed, raises from ``finish`` and stops the rollout."""
+
+    def __init__(
+        self, trainer: RLTrainer, num_generations: int, use_filter: bool
+    ) -> None:
+        super().__init__(trainer, num_generations, use_filter)
+        self._engine = trainer._ray_vllm_engine
+        self._groups: dict[concurrent.futures.Future, str] = {}
+
+    def submit(self, index: int) -> concurrent.futures.Future:
+        prompts, gts = self._trainer._get_prompts_range(index, 1)
+        [prompt_ids] = self._trainer._ray_rollout_prompt_ids(prompts)
+        handle = self._engine.submit_group(
+            prompt_ids, self._num_generations, self._sampling_params
+        )
+        self._groups[handle] = gts[0]
+        return handle
+
+    def wait(self, handles: list[Any], timeout: float) -> list[Any]:
+        done, _ = concurrent.futures.wait(
+            handles, timeout=timeout, return_when=concurrent.futures.FIRST_COMPLETED
+        )
+        return list(done)
+
+    def _collect(self, handle: Any) -> tuple[list[dict[str, Any]], str]:
+        gt = self._groups.pop(handle)
+        return handle.result(), gt
+
+    # The weight sync pauses the workers itself (requests in flight are kept
+    # and continue on the new weights) and resumes them on every exit, so the
+    # streaming rollout's pause and resume around it send nothing.
+    def pause(self) -> None:
+        pass
+
+    def resume(self) -> None:
+        pass
 
 
 class RLTrainer:
@@ -5645,7 +5743,10 @@ class RLTrainer:
             if fully_async
             else "controller.ray.one_step_off_policy"
         )
-        if not use_ray_rollout or getattr(self, "_rollout_wg", None) is None:
+        atomesh = getattr(self, "_atomesh_client", None) is not None
+        if not use_ray_rollout or (
+            getattr(self, "_rollout_wg", None) is None and not atomesh
+        ):
             raise ValueError(
                 f"{name} generates while the trainer trains, so the rollout needs "
                 "GPUs of its own: set controller.ray.rollout.num_workers > 0 with a "
@@ -5660,8 +5761,11 @@ class RLTrainer:
         if not fully_async:
             return "one_step"
         if getattr(self, "_ray_use_atom", False):
-            if bool(getattr(ray_cfg.fully_async, "partial_rollout", False)) and (
-                "keep" not in self._ray_rollout_mgr.generation_pause_modes()
+            # ATOMesh's workers pause in 'keep' mode, the only mode they serve.
+            if (
+                not atomesh
+                and bool(getattr(ray_cfg.fully_async, "partial_rollout", False))
+                and "keep" not in self._ray_rollout_mgr.generation_pause_modes()
             ):
                 raise ValueError(
                     "controller.ray.fully_async.partial_rollout on the ATOM rollout needs "
@@ -5688,8 +5792,13 @@ class RLTrainer:
         fa_cfg = self.config.controller.ray.fully_async
         pol = self.config.policy
         groups_per_step = max(1, pol.train_global_batch_size // num_generations)
-        mgr = self._ray_rollout_mgr
-        max_inflight = int(fa_cfg.max_inflight_groups) or mgr.num_replicas * max(
+        client = getattr(self, "_atomesh_client", None)
+        replicas = (
+            len(client.worker_ids)
+            if client is not None
+            else self._ray_rollout_mgr.num_replicas
+        )
+        max_inflight = int(fa_cfg.max_inflight_groups) or replicas * max(
             1,
             int(pol.generation.vllm_cfg.max_num_seqs) // num_generations,
         )
@@ -5709,8 +5818,9 @@ class RLTrainer:
             if use_filter and fg.max_num_gen_batches > 0
             else 0
         )
+        groups = _AtomMeshRolloutGroups if client is not None else _RayRolloutGroups
         pipeline = StreamingRollout(
-            _RayRolloutGroups(self, num_generations, use_filter),
+            groups(self, num_generations, use_filter),
             self._merge_rollout_groups,
             groups_per_step=groups_per_step,
             sync_every=int(fa_cfg.trigger_parameter_sync_step),

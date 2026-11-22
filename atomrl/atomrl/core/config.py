@@ -133,7 +133,8 @@ class RayWorkerRoleConfig:
 class FullyAsyncRolloutConfig:
     """Streaming rollout ahead of training, as in verl's fully_async_policy.
 
-    Needs controller.ray.rollout.num_workers > 0 and the vLLM rollout.
+    Needs a rollout on GPUs of its own: the Ray vLLM or ATOM rollout with
+    controller.ray.rollout.num_workers > 0, or ATOM through ATOMesh.
     """
 
     enabled: bool = False
@@ -1096,7 +1097,8 @@ class AtomRLConfig:
         shares the trainer's GPUs with the rollout applies: no CUDA IPC or
         shared-folder sync, no sleep between rollout and training, no Ray
         rollout pool. The stream has no RDMA preflight route, so RDMA cannot be
-        required, and the rollout cannot overlap training.
+        required. Of the rollouts that overlap training, only the fully async
+        one runs here.
         """
         atom = self.policy.generation.atom_cfg
         if atom.transport != "atomesh":
@@ -1125,9 +1127,8 @@ class AtomRLConfig:
             "rollout does not share the trainer's GPUs": (
                 self.policy.generation.vllm_cfg.enable_sleep_mode
             ),
-            "controller.ray.one_step_off_policy and "
-            "controller.ray.fully_async.enabled must be false": (
-                ray_cfg.one_step_off_policy or ray_cfg.fully_async.enabled
+            "controller.ray.one_step_off_policy must be false": (
+                ray_cfg.one_step_off_policy
             ),
         }
         problems = [why for why, bad in refused.items() if bad]
