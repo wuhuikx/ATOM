@@ -89,6 +89,7 @@ class AtomMeshRolloutClient:
     its prompt's token ids, the worker's request id, ``weight_version`` and
     ``cached_tokens``: the record that shows whether a prompt sent again
     after a weight sync hit a prefix cached under the old weights.
+    ``drain_sample_meta`` empties it into a step's statistics.
 
     ``api_key`` is ATOMesh's ``--rl-api-key``, presented on every ``/v1/rl``
     call; ``control_timeout_s`` is ATOMesh's ``--rl-control-timeout-secs``.
@@ -110,6 +111,9 @@ class AtomMeshRolloutClient:
         self.committed_version = int(committed_version)
         self.timeout_s = float(timeout_s)
         self.sample_meta: list[dict[str, Any]] = []
+        # The highest weight version each prompt has been answered under,
+        # across drains, keyed by the hash of its token ids.
+        self._prompt_versions: dict[int, int] = {}
         self.api_key = api_key
         self.control_timeout_s = float(control_timeout_s)
         # Set by join_weight_group: the trainer's worker group, the group's
@@ -232,6 +236,55 @@ class AtomMeshRolloutClient:
             "prompt_token_ids": body["input_ids"],
             "token_ids": token_ids,
             "logprobs": logprobs,
+        }
+
+    def drain_sample_meta(self) -> dict[str, float]:
+        """Empty ``sample_meta`` and summarise what it held.
+
+        Returns ``{}`` when it was empty, otherwise:
+
+        - ``cached_tokens_mean``: cached prompt tokens per sample;
+        - ``prefix_hit_rate``: cached prompt tokens over prompt tokens;
+        - ``post_sync_cached_tokens``: for each prompt answered under a weight
+          version above every one it was answered under before, the cached
+          tokens of its first sample under that version, summed. A sync drops
+          every cached prefix, so this is 0 unless a prompt hit a prefix
+          cached under the old weights;
+        - ``weight_version_lag_max``: ``committed_version`` minus the oldest
+          ``weight_version`` among the samples.
+
+        A prompt's samples run concurrently, so completion order does not say
+        which one the engine scheduled first. That one is taken to be the
+        sample with the fewest cached tokens: the later ones may legitimately
+        hit the prefix it cached under the new weights.
+        """
+        entries, self.sample_meta = self.sample_meta, []
+        if not entries:
+            return {}
+        cached = [e["cached_tokens"] for e in entries]
+        prompt_tokens = sum(len(e["prompt_token_ids"]) for e in entries)
+
+        by_prompt: dict[int, dict[int, int]] = {}
+        for e in entries:
+            fewest = by_prompt.setdefault(hash(tuple(e["prompt_token_ids"])), {})
+            v = e["weight_version"]
+            fewest[v] = min(fewest.get(v, e["cached_tokens"]), e["cached_tokens"])
+        post_sync = 0
+        for key, fewest in by_prompt.items():
+            seen = self._prompt_versions.get(key)
+            for v in sorted(fewest):
+                if seen is not None and v > seen:
+                    post_sync += fewest[v]
+                seen = v if seen is None else max(seen, v)
+            self._prompt_versions[key] = seen
+
+        return {
+            "cached_tokens_mean": sum(cached) / len(entries),
+            "prefix_hit_rate": sum(cached) / max(1, prompt_tokens),
+            "post_sync_cached_tokens": float(post_sync),
+            "weight_version_lag_max": float(
+                self.committed_version - min(e["weight_version"] for e in entries)
+            ),
         }
 
     # ── Weight sync over /v1/rl ───────────────────────────────────────────
