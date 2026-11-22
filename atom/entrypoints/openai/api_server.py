@@ -53,10 +53,12 @@ from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.collective_rpc import (
     DESTROY_RDMA_WEIGHT_GROUP_CMD,
     INIT_RDMA_WEIGHT_GROUP_CMD,
+    RECEIVE_WEIGHTS_RDMA_CMD,
 )
 from atom.model_engine.engine_utility import (
     PAUSE_GENERATION_CMD,
     RESUME_GENERATION_CMD,
+    WEIGHT_STREAM_TIMEOUT_S,
 )
 from atom.model_engine.llm_engine import InputOutputProcessor, load_tokenizer
 from atom.model_engine.request import RequestOutput
@@ -3728,6 +3730,9 @@ _RL_ROUTES = {
         "update_weights_from_distributed",
         ("names", "dtypes", "shapes", "group_name", "weight_version", "flush_cache"),
     ),
+    # One weight stream over the group the workers joined; a committed stream
+    # makes str(version) the engine's weight_version.
+    "/receive_weights_rdma": (RECEIVE_WEIGHTS_RDMA_CMD, ("group_name", "version")),
 }
 # The trainer group routes (--enable-rl): each path, the runner method
 # collective_rpc runs on every worker, and its keyword for each body field
@@ -3887,10 +3892,21 @@ def _rl_route(cmd: str, fields: tuple[str, ...]):
             return body
         if cmd == "update_weights_from_disk" and not body.get("model_path"):
             return _rl_reply(False, "model_path is required")
+        timeout = 300.0
+        if cmd == RECEIVE_WEIGHTS_RDMA_CMD:
+            refusal = _weight_stream_refusal(body)
+            if refusal is not None:
+                return _rl_reply(False, refusal)
+            # The engines answer once their runners have decided the stream,
+            # each broadcast bounded by the group's own collective timeout.
+            timeout = WEIGHT_STREAM_TIMEOUT_S
         kwargs = {name: body[name] for name in fields if name in body}
         try:
             await asyncio.to_thread(
-                engine.core_mgr.broadcast_utility_command_sync, cmd, **kwargs
+                engine.core_mgr.broadcast_utility_command_sync,
+                cmd,
+                timeout=timeout,
+                **kwargs,
             )
         except Exception as exc:  # noqa: BLE001 - answered as the route's 400
             logger.error("%s failed: %s", cmd, exc)
@@ -3898,6 +3914,18 @@ def _rl_route(cmd: str, fields: tuple[str, ...]):
         return _rl_reply(True, f"{cmd} succeeded")
 
     return route
+
+
+def _weight_stream_refusal(body: dict) -> str | None:
+    """Why a ``/receive_weights_rdma`` body cannot start a stream, if it
+    cannot: it names the group and the stream's integer version."""
+    group_name = body.get("group_name")
+    if not isinstance(group_name, str) or not group_name:
+        return "group_name is required"
+    version = body.get("version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        return "version must be an integer"
+    return None
 
 
 def _rl_group_route(name: str, method: str, fields: dict[str, str]):

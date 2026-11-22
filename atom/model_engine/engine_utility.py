@@ -96,6 +96,16 @@ def completes_weight_sync(cmd: str, args: dict) -> bool:
     )
 
 
+def named_weight_version(cmd: str, args: dict) -> str | None:
+    """The weight version an update names, if any: a weight stream names its
+    stream's ``version``, as a string; any other update its
+    ``weight_version``."""
+    if cmd == RECEIVE_WEIGHTS_RDMA_CMD:
+        version = args.get("version")
+        return None if version is None else str(int(version))
+    return args.get("weight_version")
+
+
 # For a direct weight update whose sender gives no deadline of its own;
 # broadcast_utility_command_sync always does.
 _DIRECT_UPDATE_TIMEOUT_S = 300.0
@@ -362,7 +372,7 @@ class EngineUtilityHandler:
                     if (
                         wrote
                         and self._pd_disaggregated()
-                        and args.get("weight_version") is None
+                        and named_weight_version(cmd, args) is None
                     ):
                         self._weights_unversioned = True
                     if failed:
@@ -388,7 +398,7 @@ class EngineUtilityHandler:
                         )
                     elif completes_weight_sync(cmd, args):
                         self._awaiting_finish = args.get("request_id")
-                        self._awaiting_weight_version = args.get("weight_version")
+                        self._awaiting_weight_version = named_weight_version(cmd, args)
                         if cmd == RECEIVE_WEIGHTS_RDMA_CMD:
                             self._awaiting_finish_stream = (
                                 args.get("group_name"),
@@ -479,7 +489,7 @@ class EngineUtilityHandler:
             # computed on other weights from KV it can decode on.
             if not engine._generation_paused:
                 return "a P/D engine updates its weights only while paused"
-            version = args.get("weight_version")
+            version = named_weight_version(cmd, args)
             if version is not None and version == self.scheduler.weight_version:
                 return (
                     f"a P/D engine already serves weight_version {version!r}; "
