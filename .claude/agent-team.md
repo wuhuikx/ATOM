@@ -3,7 +3,7 @@ repo: wuhuikx/ATOM
 integration_branch: atomesh-rl
 never_touch: ROCm/ATOM, junyyang-amd/ATOM
 design_entry: CLAUDE.md
-gate_task: black --check . && bash tools/rl/unit_tests.sh && (cd atom/mesh && cargo test -- --test-threads=1)
+gate_task: black --check . && bash tools/rl/unit_tests.sh && python -m pytest atomrl/tests/unit atomrl/tests/atomrl -m "not gpu and not multigpu" && (cd atom/mesh && cargo test -- --test-threads=1)
 new_tests_dir: tests
 publish_language: English
 max_tasks: 2
