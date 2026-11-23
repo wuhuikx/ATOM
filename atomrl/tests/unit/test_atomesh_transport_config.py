@@ -71,7 +71,6 @@ def test_the_direct_config_is_accepted():
         ("policy.generation_backend=vllm", "generation_backend"),
         ("controller.ray.enabled=false", "controller.ray.enabled"),
         ("controller.ray.one_step_off_policy=true", "one_step_off_policy"),
-        ("controller.ray.fully_async.enabled=true", "fully_async"),
     ],
 )
 def test_atomesh_refuses(override, named):

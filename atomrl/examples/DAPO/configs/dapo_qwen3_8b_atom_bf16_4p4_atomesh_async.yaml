@@ -1,0 +1,147 @@
+# Qwen3-8B BF16 DAPO through ATOMesh, fully async with partial rollout:
+# dapo_qwen3_8b_atom_bf16_4p4_atomesh.yaml with controller.ray.fully_async on
+# (staleness threshold 1, a weight sync after every update, in-flight groups
+# frozen across it and continued on the new weights). Compare with
+# dapo_qwen3_8b_atom_bf16_4p4_direct_async.yaml. Run name and checkpoint
+# directory are its own, so it never resumes another run's checkpoint.
+#
+#   CONFIG=examples/DAPO/configs/dapo_qwen3_8b_atom_bf16_4p4_atomesh_async.yaml \
+#     bash examples/DAPO/run_atomesh.sh
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 4
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 4
+      dispatch_mode: dp_compute_proto
+    fully_async:
+      enabled: true
+      trigger_parameter_sync_step: 1
+      staleness_threshold: 1.0
+      partial_rollout: true
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-8B-Base"
+  training_backend: fsdp2
+  generation_backend: atom
+  max_total_sequence_length: 21504
+  max_response_length: 4096
+  train_global_batch_size: 512
+  gen_batch_size: 96
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 21504
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 10
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+      reshard_after_forward: true
+  generation:
+    atom_cfg:
+      transport: atomesh
+      base_url: ""
+      api_key: ""
+      tensor_parallel_size: 1
+      kv_cache_dtype: bf16
+      gpu_memory_utilization: 0.30
+      enable_prefix_caching: true
+      online_quant_config: null
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      gpu_memory_utilization: 0.30
+      max_model_len: 21504
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 32768
+      max_num_seqs: 64
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      sleep_level: 2
+      update_weights_bucket_megabytes: 2048
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 4096
+    filter_groups:
+      enable: true
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+    lumen_norm: false
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: atomrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet"
+val_steps: 10
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: "${oc.env:DATA_ROOT}/ckpts/atomrl-dapo/4p4-atomesh-async-ray-atom-bf16-8b"
+  save_steps: 50
+  save_total_limit: 1
+  resume: true
+
+logger:
+  wandb_enabled: true
+  log_interval: 1
+  wandb:
+    project: ATOMRL
+    name: 4p4-atomesh-async-ray-atom-bf16-8b
+
+num_training_steps: 30
+seed: 10086
+
+weight_sync:
+  backend: rdma
+  rdma:
+    require_rdma: false
